@@ -1,3 +1,5 @@
 .venv/
 __pycache__/
 *.mp4
+yt_token.json
+client_secret*.json

@@ -55,6 +55,21 @@
 - ストリームキーをチャットで受け渡した場合は、終了後に Studio で
   キーをリセットする。
 
+## コメント連動（2026-10-31 実装）
+- 実装：`chat_triggers.py`（ポーリング方式）＋ `stream_live.py` の
+  `CHAT_MODE=youtube|mock`。モックで検証済み（29.9fps、判定・
+  クールダウン・色指定OK）
+- GCP プロジェクト ball-stream-demo で YouTube Data API v3 有効化済み
+- 残作業（チャンネル所有者の操作が必要）：
+  1. OAuth 同意スクリーン＋デスクトップ用クライアントを用意する
+  2. クライアント JSON を VM（または実行マシン）に置き、
+     `YT_CLIENT_SECRET_FILE` にパスを指定する
+  3. 初回起動時にブラウザで認可する（youtube.readonly のみ）。
+     以後は `yt_token.json` で自動更新される
+  4. 配信を開始してから `CHAT_MODE=youtube` で起動する
+     （アクティブな配信の liveChatId を自動で引く）
+- トークンとクライアント JSON は Git に入れない（.gitignore 済み）
+
 ## 後片付けチェックリスト
 - [ ] VM を削除（停止だけでは課金が続くため削除まで）
 - [ ] ブートディスクの削除を確認

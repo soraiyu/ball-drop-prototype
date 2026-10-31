@@ -28,10 +28,16 @@ python3 -m venv .venv
 .venv/bin/python ball_drop_stack.py   # ball_drop_stack.mp4 を生成
 ```
 
-## 次のステップ：コメント連動
-- YouTube Live Streaming API `liveChatMessages.streamList` で
-  チャットを取得し、トリガー語（例：「ボール」＋🔴🔵🟡）で
+## コメント連動（実装済み・実チャット検証待ち）
+- `gcp-demo/chat_triggers.py`：YouTube Data API v3 の
+  `liveChatMessages.list` をポーリングし、トリガー語
+  （「ボール」/「ball」＋任意で 🔴🔵🟡・赤青黄）を検出して
   `stream_live.py` の `spawn()` を呼ぶ
-- 同一ユーザー30秒クールダウン、キュー上限20を想定
+- 同一ユーザー30秒クールダウン、キュー上限20（超過は破棄して記録）
+- `CHAT_MODE=mock` でモックコメントによるオフライン検証済み
+  （30秒クールダウンと色指定も動作確認）
+- 残作業：チャンネル所有者の OAuth 認可（初回のみ）と
+  実チャットでの検証。認可手順は `gcp-demo/RUNBOOK.md`
+- 依存は `requirements-chat.txt`（本体とは分離）
 - 配信先は GCP 時間貸し継続か、OCI Always Free（A1）確保後の
   常駐かを検討中

@@ -13,6 +13,9 @@ Env:
   RTMP_URL      e.g. rtmp://a.rtmp.youtube.com/live2/<stream-key>
   OUTPUT        local file when RTMP_URL is unset (default stream_test.mp4)
   DURATION_SEC  0 = run until killed (default for live); >0 stops after N sec
+  CHAT_MODE     off (default, auto-spawn) / mock / youtube
+                In mock/youtube mode balls come from chat triggers
+                (see chat_triggers.py); a few welcome balls spawn first.
 
 Run:  .venv/bin/python stream_live.py
 """
@@ -70,8 +73,12 @@ balls = []  # (body, shape, colour)
 spawned_total = 0
 
 
-def spawn():
-    """Single entry point for dropping a ball (auto now, chat later)."""
+def spawn(colour_idx=-1):
+    """Single entry point for dropping a ball.
+
+    colour_idx 0..2 picks a colour (chat requests); -1 uses the
+    default cycle (auto-spawn and colour-less chat requests).
+    """
     global spawned_total
     i = spawned_total
     x = W / 2 + ((i * 197) % 241) - 120
@@ -81,7 +88,9 @@ def spawn():
     shape.elasticity = ELASTICITY
     shape.friction = FRICTION
     space.add(body, shape)
-    balls.append((body, shape, COLORS[i % len(COLORS)]))
+    colour = COLORS[colour_idx] if 0 <= colour_idx < len(COLORS) \
+        else COLORS[i % len(COLORS)]
+    balls.append((body, shape, colour))
     spawned_total += 1
 
 
@@ -123,6 +132,18 @@ def main():
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     target = "RTMP" if RTMP_URL else OUTPUT
     print(f"[stream] start -> {target} (clear at {CLEAR_AT})", flush=True)
+    chat_mode = os.environ.get("CHAT_MODE", "off").lower()
+    spawn_queue = None
+    if chat_mode in ("mock", "youtube"):
+        import chat_triggers
+        spawn_queue = chat_triggers.SpawnQueue()
+        source = (chat_triggers.MockChat(spawn_queue)
+                  if chat_mode == "mock"
+                  else chat_triggers.YouTubeChatPoller(spawn_queue))
+        source.start()
+        print(f"[stream] chat mode: {chat_mode}", flush=True)
+        for _ in range(3):  # welcome balls so the scene is never empty
+            spawn()
     start = time.monotonic()
     frame = 0
     next_spawn = 0.4
@@ -131,11 +152,19 @@ def main():
             t = frame / FPS
             if DURATION_SEC and t >= DURATION_SEC:
                 break
-            while t >= next_spawn:
-                spawn()
-                next_spawn += SPAWN_EVERY
-                if len(balls) >= CLEAR_AT:
-                    clear_balls()
+            if spawn_queue is not None:
+                for colour_idx, author in spawn_queue.drain(limit=5):
+                    spawn(colour_idx)
+                    print(f"[stream] chat ball for {author} "
+                          f"(total {spawned_total})", flush=True)
+                    if len(balls) >= CLEAR_AT:
+                        clear_balls()
+            else:
+                while t >= next_spawn:
+                    spawn()
+                    next_spawn += SPAWN_EVERY
+                    if len(balls) >= CLEAR_AT:
+                        clear_balls()
             for _ in range(3):
                 space.step((1.0 / FPS) / 3)
             proc.stdin.write(render_frame().tobytes())
@@ -162,6 +191,8 @@ def main():
     print(f"[stream] done: {frame} frames in {elapsed:.1f}s "
           f"({frame / max(elapsed, 0.01):.1f} fps render+encode, "
           f"{spawned_total} balls)", flush=True)
+    if spawn_queue is not None:
+        print(f"[chat] stats: {spawn_queue.stats}", flush=True)
 
 
 if __name__ == "__main__":
