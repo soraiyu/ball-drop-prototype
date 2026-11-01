@@ -7,9 +7,10 @@ Turns YouTube live-chat messages into ball spawns:
   in English works too); no colour means the stream's default cycle.
 - One spawn per author per COOLDOWN_SEC, queue capped at QUEUE_MAX;
   extra requests are dropped (and logged), never queued silently.
-- Two sources feed the same queue: the real YouTube poller
-  (YouTube Data API v3, liveChatMessages.list polling) and a mock
-  source for offline tests (CHAT_MODE=mock).
+- Sources feeding the same queue: the gRPC streamer
+  (liveChatMessages.streamList, low latency; CHAT_MODE=youtube), the
+  legacy REST poller (liveChatMessages.list; CHAT_MODE=youtube-poll),
+  and a mock source for offline tests (CHAT_MODE=mock).
 
 Auth (real source only): OAuth user credentials for the channel owner.
   YT_CLIENT_SECRET_FILE  OAuth client JSON (Desktop app) from GCP
@@ -119,6 +120,30 @@ def _load_credentials():
     return creds
 
 
+def find_live_chat_id(yt, wait_sec=600):
+    """Return the liveChatId of the channel's currently-live broadcast.
+
+    The broadcast usually goes active a little after the stream process
+    starts, so poll for it instead of failing fast. NOTE: mine=true
+    cannot be combined with broadcastStatus (the API returns 400
+    incompatibleParameters), so fetch the channel's broadcasts and
+    filter by lifecycle status here.
+    """
+    deadline = time.monotonic() + wait_sec
+    while True:
+        resp = yt.liveBroadcasts().list(
+            part="snippet,status", mine=True, maxResults=10).execute()
+        for item in resp.get("items", []):
+            if item.get("status", {}).get("lifeCycleStatus") == "live":
+                return item["snippet"]["liveChatId"]
+        if time.monotonic() > deadline:
+            raise RuntimeError("No active broadcast appeared within "
+                               f"{wait_sec}s.")
+        print("[chat] waiting for the broadcast to go active...",
+              flush=True)
+        time.sleep(10)
+
+
 class YouTubeChatPoller(threading.Thread):
     """Polls liveChatMessages.list for the channel's active broadcast."""
 
@@ -132,7 +157,7 @@ class YouTubeChatPoller(threading.Thread):
 
         yt = build("youtube", "v3", credentials=_load_credentials(),
                    cache_discovery=False)
-        chat_id = self._active_chat_id(yt)
+        chat_id = find_live_chat_id(yt)
         print(f"[chat] polling live chat {chat_id}", flush=True)
         page = None
         while True:
@@ -144,16 +169,6 @@ class YouTubeChatPoller(threading.Thread):
             page = resp.get("nextPageToken")
             wait_ms = resp.get("pollingIntervalMillis", 3000)
             time.sleep(max(wait_ms, 1000) / 1000.0)
-
-    @staticmethod
-    def _active_chat_id(yt):
-        resp = yt.liveBroadcasts().list(
-            part="snippet", mine=True, broadcastStatus="active").execute()
-        items = resp.get("items", [])
-        if not items:
-            raise RuntimeError("No active broadcast found for this "
-                               "channel; start the stream first.")
-        return items[0]["snippet"]["liveChatId"]
 
     def _handle(self, item):
         mid = item.get("id")
@@ -171,6 +186,104 @@ class YouTubeChatPoller(threading.Thread):
         if status != "ignored":
             print(f"[chat] {status}: {author.get('displayName', '?')}: "
                   f"{sn.get('displayMessage', '')[:40]}", flush=True)
+
+
+class YouTubeChatStreamer(threading.Thread):
+    """Receives live chat via liveChatMessages.streamList (gRPC).
+
+    Server-streaming: messages are pushed as they arrive, so trigger
+    latency is ~1s instead of the polling interval. Reconnects with
+    the last next_page_token when the server closes the stream;
+    stops when the response reports offline_at (chat ended).
+    Auth follows Google's demo: the OAuth access token is passed as
+    call metadata and refreshed before each (re)connect.
+    """
+
+    def __init__(self, spawn_queue):
+        super().__init__(daemon=True, name="yt-chat-stream")
+        self.spawn_queue = spawn_queue
+        self._seen = set()
+        self._creds = None
+
+    def _access_token(self):
+        from google.auth.transport.requests import Request
+
+        if self._creds is None:
+            self._creds = _load_credentials()
+        if not self._creds.valid:
+            self._creds.refresh(Request())
+        return self._creds.token
+
+    def run(self):
+        import grpc
+        from googleapiclient.discovery import build
+
+        import stream_list_pb2
+        import stream_list_pb2_grpc
+
+        self._creds = _load_credentials()
+        yt = build("youtube", "v3", credentials=self._creds,
+                   cache_discovery=False)
+        chat_id = find_live_chat_id(yt)
+        print(f"[chat] streaming live chat {chat_id}", flush=True)
+        page_token = ""
+        backoff = 1.0
+        while True:
+            try:
+                metadata = (("authorization",
+                             "Bearer " + self._access_token()),)
+                channel = grpc.secure_channel(
+                    "dns:///youtube.googleapis.com:443",
+                    grpc.ssl_channel_credentials())
+                stub = stream_list_pb2_grpc \
+                    .V3DataLiveChatMessageServiceStub(channel)
+                request = stream_list_pb2.LiveChatMessageListRequest(
+                    part=["snippet", "authorDetails"],
+                    live_chat_id=chat_id,
+                    page_token=page_token)
+                for response in stub.StreamList(request,
+                                                metadata=metadata):
+                    backoff = 1.0
+                    if response.next_page_token:
+                        page_token = response.next_page_token
+                    for item in response.items:
+                        self._handle(item)
+                    if response.offline_at:
+                        print("[chat] chat ended (offline_at set)",
+                              flush=True)
+                        return
+                print("[chat] stream closed by server; reconnecting",
+                      flush=True)
+            except grpc.RpcError as e:
+                print(f"[chat] stream error {e.code()}: {e.details()}",
+                      flush=True)
+                if e.code() == grpc.StatusCode.UNAUTHENTICATED:
+                    self._creds = None  # force reload+refresh next loop
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
+
+    def _handle(self, item):
+        import stream_list_pb2
+
+        if item.id in self._seen:
+            return
+        self._seen.add(item.id)
+        sn = item.snippet
+        text_type = stream_list_pb2.LiveChatMessageSnippet.TypeWrapper \
+            .Type.TEXT_MESSAGE_EVENT
+        if sn.type != text_type:
+            return
+        text = sn.display_message
+        if not text and sn.HasField("text_message_details"):
+            text = sn.text_message_details.message_text
+        author = item.author_details
+        status = self.spawn_queue.offer(
+            author.channel_id or sn.author_channel_id or "?",
+            author.display_name or "?",
+            text)
+        if status != "ignored":
+            print(f"[chat] {status}: {author.display_name or '?'}: "
+                  f"{text[:40]}", flush=True)
 
 
 class MockChat(threading.Thread):

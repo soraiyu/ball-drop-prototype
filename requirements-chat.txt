@@ -9,3 +9,5 @@ oauthlib==4.0.1
 requests==2.34.2
 requests-oauthlib==2.0.0
 uritemplate==4.2.0
+grpcio==1.85.1
+grpcio-tools==1.85.1

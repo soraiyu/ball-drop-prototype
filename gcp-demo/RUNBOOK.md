@@ -70,6 +70,28 @@
      （アクティブな配信の liveChatId を自動で引く）
 - トークンとクライアント JSON は Git に入れない（.gitignore 済み）
 
+### 実チャット検証（2026-11-01 夜）— 成功
+- ユーザーが OAuth 認可し、トークンで「りつねぐ」を確認。
+  VM にコードとトークンを配置し CHAT_MODE=youtube で配信、
+  本人のコメント「ボール」でボールが落ちることを確認した
+- 学び：liveBroadcasts.list は mine=true と broadcastStatus を
+  同時指定すると 400（incompatibleParameters）。mine で取得して
+  status.lifeCycleStatus == "live" を自前で絞る
+- 体感遅延 5〜10 秒の主因はポーリング間隔（数秒）と映像遅延。
+  次回は liveChatMessages.streamList（ストリーム形式）に
+  差し替えてから配信する（ユーザー決定 2026-11-01）
+
+### ストリーム形式＋協力型ゲーム（2026-11-01 実装）
+- streamList は gRPC（公式ガイド準拠）。stream_list.proto から
+  生成した stream_list_pb2.py / stream_list_pb2_grpc.py を使用。
+  CHAT_MODE=youtube がストリーム形式、youtube-poll が従来方式。
+  ハンドラ単体テスト済み、実地検証は次回配信時
+- 協力型ゲームを stream_live.py に実装：HUD進捗バー（要
+  fonts-noto-cjk）、目標到達で金色ボール（半径44＝ピン間隔を
+  通れる上限付近）＋ミニボール10個、バナーは金文字＋濃色縁取り
+  （金ボールと同色で読めなくなるため）。モックで目視確認済み
+- VM へは stream_list_pb2*.py も配置すること（startup.sh 更新済み）
+
 ## 後片付けチェックリスト
 - [ ] VM を削除（停止だけでは課金が続くため削除まで）
 - [ ] ブートディスクの削除を確認

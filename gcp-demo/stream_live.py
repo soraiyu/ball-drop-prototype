@@ -13,9 +13,12 @@ Env:
   RTMP_URL      e.g. rtmp://a.rtmp.youtube.com/live2/<stream-key>
   OUTPUT        local file when RTMP_URL is unset (default stream_test.mp4)
   DURATION_SEC  0 = run until killed (default for live); >0 stops after N sec
-  CHAT_MODE     off (default, auto-spawn) / mock / youtube
-                In mock/youtube mode balls come from chat triggers
+  CHAT_MODE     off (default, auto-spawn) / mock / youtube (gRPC
+                streamList) / youtube-poll (legacy list polling)
+                In chat modes balls come from chat triggers
                 (see chat_triggers.py); a few welcome balls spawn first.
+  GOAL_START    co-op goal for round 1 (default 50 chat balls)
+  GOAL_STEP     goal increase per round (default 25)
 
 Run:  .venv/bin/python stream_live.py
 """
@@ -26,7 +29,7 @@ import time
 
 import numpy as np
 import pymunk
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 W, H, FPS = 1280, 720, 30
 BALL_R = 26
@@ -69,36 +72,80 @@ for row, y in enumerate(range(170, 560, 78)):
         space.add(c)
         pegs.append((x, y))
 
-balls = []  # (body, shape, colour)
+balls = []  # (body, shape, colour, radius)
 spawned_total = 0
 
+# --- co-op goal game -------------------------------------------------
+GOAL_START = int(os.environ.get("GOAL_START", "50"))
+GOAL_STEP = int(os.environ.get("GOAL_STEP", "25"))
+GOLD = (255, 195, 0)
+game = {
+    "round": 1,
+    "goal": GOAL_START,
+    "progress": 0,          # chat balls this round
+    "last_author": "",
+    "banner_author": "",
+    "banner_until": 0.0,    # monotonic time; celebration banner
+}
 
-def spawn(colour_idx=-1):
+
+def spawn(colour_idx=-1, radius=BALL_R, colour=None, x=None):
     """Single entry point for dropping a ball.
 
     colour_idx 0..2 picks a colour (chat requests); -1 uses the
     default cycle (auto-spawn and colour-less chat requests).
+    radius/colour/x override for special balls (gold, mini burst).
     """
     global spawned_total
     i = spawned_total
-    x = W / 2 + ((i * 197) % 241) - 120
-    body = pymunk.Body(1.0, pymunk.moment_for_circle(1.0, 0, BALL_R))
+    if x is None:
+        x = W / 2 + ((i * 197) % 241) - 120
+    body = pymunk.Body(1.0, pymunk.moment_for_circle(1.0, 0, radius))
     body.position = (x, 50)
-    shape = pymunk.Circle(body, BALL_R)
+    shape = pymunk.Circle(body, radius)
     shape.elasticity = ELASTICITY
     shape.friction = FRICTION
     space.add(body, shape)
-    colour = COLORS[colour_idx] if 0 <= colour_idx < len(COLORS) \
-        else COLORS[i % len(COLORS)]
-    balls.append((body, shape, colour))
+    if colour is None:
+        colour = COLORS[colour_idx] if 0 <= colour_idx < len(COLORS) \
+            else COLORS[i % len(COLORS)]
+    balls.append((body, shape, colour, radius))
     spawned_total += 1
 
 
 def clear_balls():
-    for body, shape, _ in balls:
+    for body, shape, _c, _r in balls:
         space.remove(body, shape)
     balls.clear()
     print(f"[stream] cleared all balls at total {spawned_total}", flush=True)
+
+
+def celebrate(author):
+    """Goal reached: gold ball + mini-ball burst + banner."""
+    game["banner_until"] = time.monotonic() + 5.0
+    game["banner_author"] = author
+    spawn(colour=GOLD, radius=44)  # < peg gap (~104px) so it can fall
+    for k in range(10):
+        spawn(radius=12, x=W / 2 + (k - 5) * 36)
+    print(f"[game] GOAL! round {game['round']} reached by {author} "
+          f"(next goal {game['goal'] + GOAL_STEP})", flush=True)
+    game["round"] += 1
+    game["goal"] += GOAL_STEP
+    game["progress"] = 0
+
+
+def _load_font(size):
+    for path in ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                 "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+FONT_HUD = _load_font(26)
+FONT_BANNER = _load_font(44)
 
 
 def render_frame():
@@ -108,10 +155,30 @@ def render_frame():
     for px, py in pegs:
         d.ellipse([px - PEG_R, py - PEG_R, px + PEG_R, py + PEG_R],
                   fill=(200, 205, 215))
-    for body, _shape, c in balls:
+    for body, _shape, c, r in balls:
         x, y = body.position
-        d.ellipse([x - BALL_R, y - BALL_R, x + BALL_R, y + BALL_R], fill=c)
+        d.ellipse([x - r, y - r, x + r, y + r], fill=c)
+    _draw_hud(d)
     return np.asarray(img)
+
+
+def _draw_hud(d):
+    # co-op progress: label + bar along the top
+    goal = max(game["goal"], 1)
+    frac = min(game["progress"] / goal, 1.0)
+    d.rectangle([0, 0, W, 46], fill=(16, 19, 25))
+    d.rectangle([330, 12, W - 24, 34], outline=(120, 128, 145), width=2)
+    if frac > 0:
+        d.rectangle([332, 14, 332 + int((W - 358) * frac), 32], fill=GOLD)
+    d.text((16, 8), f"ROUND {game['round']}  みんなで {game['progress']}"
+           f" / {game['goal']}", font=FONT_HUD, fill=(235, 238, 245))
+    if time.monotonic() < game["banner_until"]:
+        msg = f"GOAL! 最後の一押し: {game['banner_author'][:16]}"
+        bbox = d.textbbox((0, 0), msg, font=FONT_BANNER)
+        tw = bbox[2] - bbox[0]
+        # dark stroke: the gold text must stay readable over gold balls
+        d.text(((W - tw) / 2, 64), msg, font=FONT_BANNER, fill=GOLD,
+               stroke_width=3, stroke_fill=(24, 28, 36))
 
 
 def ffmpeg_cmd():
@@ -134,12 +201,15 @@ def main():
     print(f"[stream] start -> {target} (clear at {CLEAR_AT})", flush=True)
     chat_mode = os.environ.get("CHAT_MODE", "off").lower()
     spawn_queue = None
-    if chat_mode in ("mock", "youtube"):
+    if chat_mode in ("mock", "youtube", "youtube-poll"):
         import chat_triggers
         spawn_queue = chat_triggers.SpawnQueue()
-        source = (chat_triggers.MockChat(spawn_queue)
-                  if chat_mode == "mock"
-                  else chat_triggers.YouTubeChatPoller(spawn_queue))
+        if chat_mode == "mock":
+            source = chat_triggers.MockChat(spawn_queue)
+        elif chat_mode == "youtube-poll":
+            source = chat_triggers.YouTubeChatPoller(spawn_queue)
+        else:
+            source = chat_triggers.YouTubeChatStreamer(spawn_queue)
         source.start()
         print(f"[stream] chat mode: {chat_mode}", flush=True)
         for _ in range(3):  # welcome balls so the scene is never empty
@@ -155,8 +225,14 @@ def main():
             if spawn_queue is not None:
                 for colour_idx, author in spawn_queue.drain(limit=5):
                     spawn(colour_idx)
+                    game["progress"] += 1
+                    game["last_author"] = author
                     print(f"[stream] chat ball for {author} "
-                          f"(total {spawned_total})", flush=True)
+                          f"(total {spawned_total}, round "
+                          f"{game['round']}: {game['progress']}/"
+                          f"{game['goal']})", flush=True)
+                    if game["progress"] >= game["goal"]:
+                        celebrate(author)
                     if len(balls) >= CLEAR_AT:
                         clear_balls()
             else:
