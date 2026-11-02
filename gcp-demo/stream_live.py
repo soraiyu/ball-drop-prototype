@@ -21,6 +21,7 @@ Env:
   GOAL_STEP     goal increase per round (default 25)
   SUBS_MODE     off (default) / on / mock — new-subscriber watcher
                 (see subscriber_watch.py); on = YouTube API polling
+  THEME         dark (default) / light — colour palette
 
 Run:  .venv/bin/python stream_live.py
 """
@@ -75,6 +76,26 @@ for row, y in enumerate(range(170, 560, 78)):
         c.friction = 0.3
         space.add(c)
         pegs.append((x, y))
+
+THEMES = {
+    "dark": {
+        "bg": (24, 28, 36), "floor": (60, 65, 80),
+        "peg": (200, 205, 215), "hud_bg": (16, 19, 25),
+        "hud_text": (235, 238, 245), "hud_bar_bg": None,
+        "ball_outline": None, "duck_outline": (120, 120, 115),
+        "sub_text": (200, 205, 215),
+    },
+    "light": {  # pale sky + pond floor; balls get a dark outline
+        "bg": (236, 243, 248), "floor": (168, 208, 220),
+        "peg": (110, 124, 140), "hud_bg": (252, 250, 243),
+        "hud_text": (40, 45, 55), "hud_bar_bg": (255, 255, 255),
+        "ball_outline": (38, 42, 52), "duck_outline": (105, 100, 90),
+        "sub_text": (70, 80, 95),
+    },
+}
+THEME = THEMES[os.environ.get("THEME", "dark").lower()] \
+    if os.environ.get("THEME", "dark").lower() in THEMES \
+    else THEMES["dark"]
 
 balls = []  # (body, shape, colour, radius)
 spawned_total = 0
@@ -211,8 +232,18 @@ class Duck:
         self.hop_height = 16
         self.bubble = ""
         self.bubble_until = 0.0
+        self.last_active = time.monotonic()
+        self.napping = False
+        self.flee_until = 0.0
+        self.flee_dir = 1
+        self._gaa_until = 0.0    # ガー！ cooldown
+
+    def _wake(self):
+        self.last_active = time.monotonic()
+        self.napping = False
 
     def hop(self, height=16):
+        self._wake()
         self.hop_height = height
         self.hop_phase = 0.0
 
@@ -221,21 +252,55 @@ class Duck:
         self.say("やった！")
 
     def say(self, text, seconds=2.5):
+        self._wake()
         self.bubble = text
         self.bubble_until = time.monotonic() + seconds
 
-    def update(self, dt):
-        self.x += self.dir * self.speed * dt
-        if self.x < 90:
-            self.x, self.dir = 90, 1
-        elif self.x > W - 90:
-            self.x, self.dir = W - 90, -1
-        elif random.random() < 0.002:
-            self.dir *= -1
+    def update(self, dt, balls=()):
+        now = time.monotonic()
+        # --- reactions to nearby balls ------------------------------
+        head_x = self.x + 24 * self.dir
+        head_y = H - 62 + self._y_offset()
+        for body, _s, _c, _r in balls:
+            bx, by = body.position
+            vx, vy = body.velocity
+            # ball about to land where the duck stands -> dodge
+            if (vy > 200 and 260 < by < H - 130
+                    and abs(bx - self.x) < 70
+                    and now >= self.flee_until):
+                self.flee_dir = 1 if self.x >= bx else -1
+                self.flee_until = now + 0.55
+                self._wake()
+                print("[duck] dodged!", flush=True)
+            # ball whizzing past the head -> ガー！
+            if (vx * vx + vy * vy > 150 * 150
+                    and abs(bx - head_x) < 58 and abs(by - head_y) < 58
+                    and now >= self._gaa_until):
+                self._gaa_until = now + 3.0
+                self.say("ガー！", seconds=1.2)
+                self.hop_phase = 0.0
+                self.hop_height = 10
+                print("[duck] ガー！", flush=True)
+        # --- locomotion ----------------------------------------------
         if self.hop_phase is not None:
             self.hop_phase += dt / 0.5
             if self.hop_phase >= 1.0:
                 self.hop_phase = None
+        if now < self.flee_until:
+            self.dir = self.flee_dir
+            self.x += self.dir * 250.0 * dt
+        elif self.napping:
+            pass  # standing still, asleep
+        else:
+            if now - self.last_active > 45:
+                self.napping = True
+            self.x += self.dir * self.speed * dt
+            if random.random() < 0.002:
+                self.dir *= -1
+        if self.x < 90:
+            self.x, self.dir = 90, 1
+        elif self.x > W - 90:
+            self.x, self.dir = W - 90, -1
 
     def _y_offset(self):
         if self.hop_phase is None:
@@ -248,7 +313,7 @@ class Duck:
         x = self.x
         f = self.dir  # facing
         white = (245, 245, 240)
-        outline = (120, 120, 115)
+        outline = THEME["duck_outline"]
         # tail
         d.polygon([(x - 34 * f, y_base - 34), (x - 48 * f, y_base - 48),
                    (x - 26 * f, y_base - 46)], fill=white, outline=outline)
@@ -270,6 +335,14 @@ class Duck:
                width=3)
         d.line([x + 10, y_base - 4, x + 10, y_base], fill=(245, 166, 35),
                width=3)
+        # nap indicator: floating Z's
+        if self.napping:
+            phase = int(time.monotonic() * 2) % 2
+            d.text((x + 26, y_base - 108), "Z", font=FONT_SMALL,
+                   fill=THEME["sub_text"])
+            if phase:
+                d.text((x + 40, y_base - 122), "Z", font=FONT_HUD,
+                       fill=THEME["sub_text"])
         # speech bubble
         if self.bubble and time.monotonic() < self.bubble_until:
             text = self.bubble
@@ -288,15 +361,17 @@ duck = Duck()
 
 
 def render_frame():
-    img = Image.new("RGB", (W, H), (24, 28, 36))
+    img = Image.new("RGB", (W, H), THEME["bg"])
     d = ImageDraw.Draw(img)
-    d.rectangle([0, H - 10, W, H], fill=(60, 65, 80))
+    d.rectangle([0, H - 10, W, H], fill=THEME["floor"])
     for px, py in pegs:
         d.ellipse([px - PEG_R, py - PEG_R, px + PEG_R, py + PEG_R],
-                  fill=(200, 205, 215))
+                  fill=THEME["peg"])
     for body, _shape, c, r in balls:
         x, y = body.position
-        d.ellipse([x - r, y - r, x + r, y + r], fill=c)
+        d.ellipse([x - r, y - r, x + r, y + r], fill=c,
+                  outline=THEME["ball_outline"],
+                  width=2 if THEME["ball_outline"] else 1)
     duck.draw(d)
     _draw_hud(d)
     return np.asarray(img)
@@ -306,17 +381,19 @@ def _draw_hud(d):
     # co-op progress: label + bar along the top
     goal = max(game["goal"], 1)
     frac = min(game["progress"] / goal, 1.0)
-    d.rectangle([0, 0, W, 46], fill=(16, 19, 25))
+    d.rectangle([0, 0, W, 46], fill=THEME["hud_bg"])
+    if THEME["hud_bar_bg"]:
+        d.rectangle([330, 12, W - 24, 34], fill=THEME["hud_bar_bg"])
     d.rectangle([330, 12, W - 24, 34], outline=(120, 128, 145), width=2)
     if frac > 0:
         d.rectangle([332, 14, 332 + int((W - 358) * frac), 32], fill=GOLD)
     d.text((16, 8), f"ROUND {game['round']}  みんなで {game['progress']}"
-           f" / {game['goal']}", font=FONT_HUD, fill=(235, 238, 245))
+           f" / {game['goal']}", font=FONT_HUD, fill=THEME["hud_text"])
     if subs_state.get("count") is not None:
         label = f"登録者 {subs_state['count']}人"
         bbox = d.textbbox((0, 0), label, font=FONT_SMALL)
         d.text((W - (bbox[2] - bbox[0]) - 14, H - 34), label,
-               font=FONT_SMALL, fill=(200, 205, 215))
+               font=FONT_SMALL, fill=THEME["sub_text"])
     _advance_banner()
     if banner["text"] and time.monotonic() < banner["until"]:
         msg = banner["text"]
@@ -385,7 +462,7 @@ def main():
                     except Exception:
                         break
                     celebrate_subscriber(ev)
-            duck.update(1.0 / FPS)
+            duck.update(1.0 / FPS, balls)
             if spawn_queue is not None:
                 for colour_idx, author in spawn_queue.drain(limit=5):
                     spawn(colour_idx)
