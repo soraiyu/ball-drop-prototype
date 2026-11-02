@@ -34,7 +34,7 @@ _COLOUR_WORDS = [
     (1, ("🔵", "青", "blue")),
     (2, ("🟡", "黄", "yellow")),
 ]
-_TRIGGERS = ("ボール", "ball")
+_TRIGGERS = ("ボール", "ball", "bola", "球", "공")
 
 
 def parse_trigger(text):

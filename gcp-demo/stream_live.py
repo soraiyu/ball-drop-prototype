@@ -173,7 +173,7 @@ def clear_balls():
 
 def celebrate(author):
     """Goal reached: gold ball + mini-ball burst + banner."""
-    set_banner(f"GOAL! 最後の一押し: {author[:16]}")
+    set_banner(f"GOAL! 最後の一押し: {author[:16]}\nWe reached the goal together!")
     # radius 34: diameter 68 stays clear of the peg-row wedge
     # (row pitch 90 - pegs 24 = 66..72 is the danger zone; the
     # earlier radius 44 wedged between rows and never fell)
@@ -194,7 +194,7 @@ def celebrate_subscriber(ev):
     set_banner(f"ようこそ！ {name[:16]}"
                f"（およそ{ev['approx']}番前後の仲間）", seconds=6.0)
     spawn(colour=GOLD, radius=34)
-    duck.say("ようこそ！")
+    duck.say("ようこそ！ Welcome!")
     print(f"[subs] celebrating {name} (~{ev['approx']})", flush=True)
 
 
@@ -249,7 +249,7 @@ class Duck:
 
     def celebrate(self):
         self.hop(30)
-        self.say("やった！")
+        self.say("やった！ Yay!")
 
     def say(self, text, seconds=2.5):
         self._wake()
@@ -277,7 +277,7 @@ class Duck:
                     and abs(bx - head_x) < 58 and abs(by - head_y) < 58
                     and now >= self._gaa_until):
                 self._gaa_until = now + 3.0
-                self.say("ガー！", seconds=1.2)
+                self.say("ガー！ Quack!", seconds=1.2)
                 self.hop_phase = 0.0
                 self.hop_height = 10
                 print("[duck] ガー！", flush=True)
@@ -394,6 +394,10 @@ def _draw_hud(d):
         bbox = d.textbbox((0, 0), label, font=FONT_SMALL)
         d.text((W - (bbox[2] - bbox[0]) - 14, H - 34), label,
                font=FONT_SMALL, fill=THEME["sub_text"])
+    hint = "コメント『ボール』/ \"ball\" でボールが落ちるよ ・ Comment \"ball\" to drop a ball!"
+    hb = d.textbbox((0, 0), hint, font=FONT_SMALL)
+    d.text(((W - (hb[2] - hb[0])) / 2, H - 32), hint, font=FONT_SMALL,
+           fill=THEME["sub_text"])
     _advance_banner()
     if banner["text"] and time.monotonic() < banner["until"]:
         msg = banner["text"]
