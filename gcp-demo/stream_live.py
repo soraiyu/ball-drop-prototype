@@ -19,10 +19,14 @@ Env:
                 (see chat_triggers.py); a few welcome balls spawn first.
   GOAL_START    co-op goal for round 1 (default 50 chat balls)
   GOAL_STEP     goal increase per round (default 25)
+  SUBS_MODE     off (default) / on / mock — new-subscriber watcher
+                (see subscriber_watch.py); on = YouTube API polling
 
 Run:  .venv/bin/python stream_live.py
 """
+import math
 import os
+import random
 import subprocess
 import sys
 import time
@@ -74,6 +78,8 @@ for row, y in enumerate(range(170, 560, 78)):
 
 balls = []  # (body, shape, colour, radius)
 spawned_total = 0
+_born = {}  # id(body) -> spawn monotonic time (for the unstick rule)
+_stuck_dir = {}  # id(body) -> escape direction while unsticking
 
 # --- co-op goal game -------------------------------------------------
 GOAL_START = int(os.environ.get("GOAL_START", "50"))
@@ -84,9 +90,30 @@ game = {
     "goal": GOAL_START,
     "progress": 0,          # chat balls this round
     "last_author": "",
-    "banner_author": "",
-    "banner_until": 0.0,    # monotonic time; celebration banner
 }
+
+# generic centre banner queue (goal / new subscriber / ...):
+# banners display one at a time, in order, so simultaneous events
+# do not erase each other.
+banner = {"text": "", "until": 0.0, "queue": []}
+subs_state = {"count": None}
+
+
+def set_banner(text, seconds=5.0):
+    now = time.monotonic()
+    if now >= banner["until"] and not banner["queue"]:
+        banner["text"] = text
+        banner["until"] = now + seconds
+    else:
+        banner["queue"].append((text, seconds))
+
+
+def _advance_banner():
+    now = time.monotonic()
+    if now >= banner["until"] and banner["queue"]:
+        text, seconds = banner["queue"].pop(0)
+        banner["text"] = text
+        banner["until"] = now + seconds
 
 
 def spawn(colour_idx=-1, radius=BALL_R, colour=None, x=None):
@@ -110,6 +137,7 @@ def spawn(colour_idx=-1, radius=BALL_R, colour=None, x=None):
         colour = COLORS[colour_idx] if 0 <= colour_idx < len(COLORS) \
             else COLORS[i % len(COLORS)]
     balls.append((body, shape, colour, radius))
+    _born[id(body)] = time.monotonic()
     spawned_total += 1
 
 
@@ -117,21 +145,36 @@ def clear_balls():
     for body, shape, _c, _r in balls:
         space.remove(body, shape)
     balls.clear()
+    _born.clear()
+    _stuck_dir.clear()
     print(f"[stream] cleared all balls at total {spawned_total}", flush=True)
 
 
 def celebrate(author):
     """Goal reached: gold ball + mini-ball burst + banner."""
-    game["banner_until"] = time.monotonic() + 5.0
-    game["banner_author"] = author
-    spawn(colour=GOLD, radius=44)  # < peg gap (~104px) so it can fall
+    set_banner(f"GOAL! 最後の一押し: {author[:16]}")
+    # radius 34: diameter 68 stays clear of the peg-row wedge
+    # (row pitch 90 - pegs 24 = 66..72 is the danger zone; the
+    # earlier radius 44 wedged between rows and never fell)
+    spawn(colour=GOLD, radius=34)
     for k in range(10):
         spawn(radius=12, x=W / 2 + (k - 5) * 36)
+    duck.celebrate()
     print(f"[game] GOAL! round {game['round']} reached by {author} "
           f"(next goal {game['goal'] + GOAL_STEP})", flush=True)
     game["round"] += 1
     game["goal"] += GOAL_STEP
     game["progress"] = 0
+
+
+def celebrate_subscriber(ev):
+    """New subscriber: gold ball + welcome banner + duck bubble."""
+    name = ev.get("name") or "非公開の新しい仲間"
+    set_banner(f"ようこそ！ {name[:16]}"
+               f"（およそ{ev['approx']}番前後の仲間）", seconds=6.0)
+    spawn(colour=GOLD, radius=34)
+    duck.say("ようこそ！")
+    print(f"[subs] celebrating {name} (~{ev['approx']})", flush=True)
 
 
 def _load_font(size):
@@ -145,7 +188,103 @@ def _load_font(size):
 
 
 FONT_HUD = _load_font(26)
+FONT_SMALL = _load_font(20)
 FONT_BANNER = _load_font(44)
+FONT_BANNER_S = _load_font(30)
+
+
+# --- the resident duck ----------------------------------------------
+class Duck:
+    """A white duck living on the floor of the board.
+
+    Visual only (no physics body): wanders left/right, hops when a
+    chat ball drops, celebrates goals, and speaks via speech bubbles
+    ("ようこそ！" etc.). Drawn with PIL shapes so it needs no assets;
+    swapping in real artwork later only changes draw().
+    """
+
+    def __init__(self):
+        self.x = W * 0.3
+        self.dir = 1
+        self.speed = 26.0        # px/s
+        self.hop_phase = None    # 0..1 while hopping
+        self.hop_height = 16
+        self.bubble = ""
+        self.bubble_until = 0.0
+
+    def hop(self, height=16):
+        self.hop_height = height
+        self.hop_phase = 0.0
+
+    def celebrate(self):
+        self.hop(30)
+        self.say("やった！")
+
+    def say(self, text, seconds=2.5):
+        self.bubble = text
+        self.bubble_until = time.monotonic() + seconds
+
+    def update(self, dt):
+        self.x += self.dir * self.speed * dt
+        if self.x < 90:
+            self.x, self.dir = 90, 1
+        elif self.x > W - 90:
+            self.x, self.dir = W - 90, -1
+        elif random.random() < 0.002:
+            self.dir *= -1
+        if self.hop_phase is not None:
+            self.hop_phase += dt / 0.5
+            if self.hop_phase >= 1.0:
+                self.hop_phase = None
+
+    def _y_offset(self):
+        if self.hop_phase is None:
+            return 0
+        return -int(abs(math.sin(math.pi * self.hop_phase))
+                    * self.hop_height)
+
+    def draw(self, d):
+        y_base = H - 10 + self._y_offset()
+        x = self.x
+        f = self.dir  # facing
+        white = (245, 245, 240)
+        outline = (120, 120, 115)
+        # tail
+        d.polygon([(x - 34 * f, y_base - 34), (x - 48 * f, y_base - 48),
+                   (x - 26 * f, y_base - 46)], fill=white, outline=outline)
+        # body
+        d.ellipse([x - 36, y_base - 40, x + 36, y_base - 6],
+                  fill=white, outline=outline)
+        # head
+        hx, hy = x + 24 * f, y_base - 52
+        d.ellipse([hx - 15, hy - 15, hx + 15, hy + 15],
+                  fill=white, outline=outline)
+        # beak
+        bx = hx + 14 * f
+        d.ellipse([bx - 8, hy - 4, bx + 8, hy + 5], fill=(245, 166, 35))
+        # eye
+        d.ellipse([hx + 5 * f - 2, hy - 6, hx + 5 * f + 2, hy - 2],
+                  fill=(30, 30, 30))
+        # feet
+        d.line([x - 10, y_base - 4, x - 10, y_base], fill=(245, 166, 35),
+               width=3)
+        d.line([x + 10, y_base - 4, x + 10, y_base], fill=(245, 166, 35),
+               width=3)
+        # speech bubble
+        if self.bubble and time.monotonic() < self.bubble_until:
+            text = self.bubble
+            bbox = d.textbbox((0, 0), text, font=FONT_SMALL)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            bx, by = x - tw / 2 - 10, y_base - 118
+            d.rounded_rectangle([bx, by, bx + tw + 20, by + th + 14],
+                                radius=10, fill=(255, 255, 255))
+            d.polygon([(x - 5, by + th + 14), (x + 5, by + th + 14),
+                       (x, by + th + 24)], fill=(255, 255, 255))
+            d.text((bx + 10, by + 5), text, font=FONT_SMALL,
+                   fill=(30, 30, 30))
+
+
+duck = Duck()
 
 
 def render_frame():
@@ -158,6 +297,7 @@ def render_frame():
     for body, _shape, c, r in balls:
         x, y = body.position
         d.ellipse([x - r, y - r, x + r, y + r], fill=c)
+    duck.draw(d)
     _draw_hud(d)
     return np.asarray(img)
 
@@ -172,12 +312,19 @@ def _draw_hud(d):
         d.rectangle([332, 14, 332 + int((W - 358) * frac), 32], fill=GOLD)
     d.text((16, 8), f"ROUND {game['round']}  みんなで {game['progress']}"
            f" / {game['goal']}", font=FONT_HUD, fill=(235, 238, 245))
-    if time.monotonic() < game["banner_until"]:
-        msg = f"GOAL! 最後の一押し: {game['banner_author'][:16]}"
-        bbox = d.textbbox((0, 0), msg, font=FONT_BANNER)
+    if subs_state.get("count") is not None:
+        label = f"登録者 {subs_state['count']}人"
+        bbox = d.textbbox((0, 0), label, font=FONT_SMALL)
+        d.text((W - (bbox[2] - bbox[0]) - 14, H - 34), label,
+               font=FONT_SMALL, fill=(200, 205, 215))
+    _advance_banner()
+    if banner["text"] and time.monotonic() < banner["until"]:
+        msg = banner["text"]
+        font = FONT_BANNER if len(msg) <= 22 else FONT_BANNER_S
+        bbox = d.textbbox((0, 0), msg, font=font)
         tw = bbox[2] - bbox[0]
         # dark stroke: the gold text must stay readable over gold balls
-        d.text(((W - tw) / 2, 64), msg, font=FONT_BANNER, fill=GOLD,
+        d.text(((W - tw) / 2, 64), msg, font=font, fill=GOLD,
                stroke_width=3, stroke_fill=(24, 28, 36))
 
 
@@ -214,6 +361,15 @@ def main():
         print(f"[stream] chat mode: {chat_mode}", flush=True)
         for _ in range(3):  # welcome balls so the scene is never empty
             spawn()
+
+    subs_mode = os.environ.get("SUBS_MODE", "off").lower()
+    subs_events = None
+    if subs_mode in ("on", "mock"):
+        import subscriber_watch
+        watcher, subs_events = subscriber_watch.make_watcher(
+            "mock" if subs_mode == "mock" else "on", subs_state)
+        watcher.start()
+        print(f"[stream] subscriber watch: {subs_mode}", flush=True)
     start = time.monotonic()
     frame = 0
     next_spawn = 0.4
@@ -222,9 +378,18 @@ def main():
             t = frame / FPS
             if DURATION_SEC and t >= DURATION_SEC:
                 break
+            if subs_events is not None:
+                while True:
+                    try:
+                        ev = subs_events.get_nowait()
+                    except Exception:
+                        break
+                    celebrate_subscriber(ev)
+            duck.update(1.0 / FPS)
             if spawn_queue is not None:
                 for colour_idx, author in spawn_queue.drain(limit=5):
                     spawn(colour_idx)
+                    duck.hop()
                     game["progress"] += 1
                     game["last_author"] = author
                     print(f"[stream] chat ball for {author} "
@@ -243,6 +408,27 @@ def main():
                         clear_balls()
             for _ in range(3):
                 space.step((1.0 / FPS) / 3)
+            # Unstick special (oversize) balls wedged on peg tops:
+            # two gold balls can stabilise each other in a pocket.
+            # A big ball still away from the floor and barely
+            # falling 5s after spawn gets a SUSTAINED sideways push
+            # (one set velocity is not enough to climb out of the
+            # pocket) until it is falling again.
+            now_m = time.monotonic()
+            for body, _s, _c, _r in balls:
+                key = id(body)
+                if _r <= BALL_R or body.position.y >= H - 120:
+                    _stuck_dir.pop(key, None)
+                    continue
+                if abs(body.velocity.y) >= 60:
+                    if key in _stuck_dir:
+                        _stuck_dir.pop(key, None)
+                        _born[key] = now_m  # re-arm
+                    continue
+                if now_m - _born.get(key, now_m) > 5:
+                    d = _stuck_dir.setdefault(
+                        key, random.choice([-1, 1]))
+                    body.velocity = (d * 190, body.velocity.y)
             proc.stdin.write(render_frame().tobytes())
             frame += 1
             # real-time pacing: sleep until this frame's deadline

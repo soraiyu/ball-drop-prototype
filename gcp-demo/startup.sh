@@ -13,4 +13,4 @@ python3 -m venv /opt/ballstream/.venv
 /opt/ballstream/.venv/bin/pip install pymunk pillow numpy \
   google-api-python-client google-auth-oauthlib grpcio
 
-echo "setup done: copy stream_live.py, chat_triggers.py, stream_list_pb2.py, stream_list_pb2_grpc.py (and yt_token.json for chat modes) to /opt/ballstream/ and run with /opt/ballstream/.venv/bin/python"
+echo "setup done: copy stream_live.py, chat_triggers.py, subscriber_watch.py, stream_list_pb2.py, stream_list_pb2_grpc.py (and yt_token.json for chat/subs modes) to /opt/ballstream/ and run with /opt/ballstream/.venv/bin/python"
