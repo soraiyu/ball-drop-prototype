@@ -110,3 +110,23 @@
 - [ ] ブートディスクの削除を確認
 - [ ] 翌日までに課金レポートで想定額（数十円）に収まることを確認
 - [ ] OCI 側の A1 監視（15分ごと直接作成）が継続していることを確認
+
+## Lessons 2026-11-02/03 (first scheduled sessions)
+- Persistent-key broadcasts do NOT auto-start on push alone here: the
+  owner opened the Studio live page, then we re-pushed (kill tmux,
+  sleep 10, start again) and the broadcast appeared. Procedure: owner
+  opens Studio first, then (re)start the push.
+- CHAT QUOTA: YouTube Data API default is 10,000 units/day (resets
+  00:00 Pacific = 17:00 JST). liveChatMessages.list = 5 units/call.
+  Following pollingIntervalMillis (~3s) burns ~100 units/min and the
+  budget died ~00:51 JST on 2026-11-03, silently killing chat.
+  Fixes in code: CHAT_POLL_MIN_MS floor (default 10s -> ~5,400/3h),
+  quota errors pause-and-retry instead of killing threads,
+  find_live_chat_id waits 30s and binds the NEWEST live broadcast
+  (older ones can stay "live" in the API), subs poll 120s.
+- Session 1 used streamList (gRPC): 259 server closes in 47 min;
+  still undiagnosed. Polling is the production path for now.
+- Cooldown removed at the owner's request (CHAT_COOLDOWN_SEC=0 in
+  start_stream.sh); queue cap 20 still applies.
+- A dedicated browser profile for GCP work exists: 「ボール配信GCP専用」
+  p6b1a2f6d1c41 (see ~/TOOLS.md).

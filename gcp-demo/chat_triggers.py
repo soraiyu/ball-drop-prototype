@@ -131,17 +131,38 @@ def find_live_chat_id(yt, wait_sec=600):
     """
     deadline = time.monotonic() + wait_sec
     while True:
-        resp = yt.liveBroadcasts().list(
-            part="snippet,status", mine=True, maxResults=10).execute()
-        for item in resp.get("items", []):
-            if item.get("status", {}).get("lifeCycleStatus") == "live":
-                return item["snippet"]["liveChatId"]
+        try:
+            resp = yt.liveBroadcasts().list(
+                part="snippet,status", mine=True, maxResults=10).execute()
+        except Exception as e:
+            if "quota" in str(e).lower():
+                # Quota exhaustion must not kill the chat thread; the
+                # daily budget resets at midnight Pacific (17:00 JST).
+                print("[chat] quota exceeded while waiting; "
+                      "sleeping 60s", flush=True)
+                time.sleep(60)
+                deadline += 60
+                continue
+            raise
+        live = [it for it in resp.get("items", [])
+                if it.get("status", {}).get("lifeCycleStatus") == "live"]
+        if live:
+            # An earlier session's broadcast can stay "live" in the API
+            # after its encoder was killed; bind to the NEWEST one.
+            live.sort(key=lambda it: it["snippet"].get(
+                "actualStartTime") or it["snippet"].get("publishedAt") or "",
+                reverse=True)
+            item = live[0]
+            print(f"[chat] bound to broadcast {item['id']} "
+                  f"started {item['snippet'].get('actualStartTime')}",
+                  flush=True)
+            return item["snippet"]["liveChatId"]
         if time.monotonic() > deadline:
             raise RuntimeError("No active broadcast appeared within "
                                f"{wait_sec}s.")
         print("[chat] waiting for the broadcast to go active...",
               flush=True)
-        time.sleep(10)
+        time.sleep(30)
 
 
 class YouTubeChatPoller(threading.Thread):
@@ -159,16 +180,36 @@ class YouTubeChatPoller(threading.Thread):
                    cache_discovery=False)
         chat_id = find_live_chat_id(yt)
         print(f"[chat] polling live chat {chat_id}", flush=True)
+        # Quota math: liveChatMessages.list costs 5 units/call and the
+        # daily budget is 10,000. YouTube's suggested interval (~3s)
+        # would burn ~18,000 units in a 3h session, so enforce a floor
+        # (default 10s -> ~5,400 units/3h). Env: CHAT_POLL_MIN_MS.
+        min_ms = int(os.environ.get("CHAT_POLL_MIN_MS", "10000"))
         page = None
         while True:
-            resp = yt.liveChatMessages().list(
-                liveChatId=chat_id, part="snippet,authorDetails",
-                pageToken=page).execute()
+            try:
+                resp = yt.liveChatMessages().list(
+                    liveChatId=chat_id, part="snippet,authorDetails",
+                    pageToken=page).execute()
+            except Exception as e:
+                msg = str(e)
+                if "quota" in msg.lower():
+                    print("[chat] quota exceeded; pausing 180s",
+                          flush=True)
+                    time.sleep(180)
+                    continue
+                if "liveChatEnded" in msg or "404" in msg:
+                    print("[chat] live chat ended; poller stopping",
+                          flush=True)
+                    return
+                print(f"[chat] poll failed: {e}", flush=True)
+                time.sleep(15)
+                continue
             for item in resp.get("items", []):
                 self._handle(item)
             page = resp.get("nextPageToken")
             wait_ms = resp.get("pollingIntervalMillis", 3000)
-            time.sleep(max(wait_ms, 1000) / 1000.0)
+            time.sleep(max(wait_ms, min_ms) / 1000.0)
 
     def _handle(self, item):
         mid = item.get("id")

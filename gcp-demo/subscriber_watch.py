@@ -26,7 +26,7 @@ import queue
 import threading
 import time
 
-POLL_SEC = int(os.environ.get("SUBS_POLL_SEC", "45"))
+POLL_SEC = int(os.environ.get("SUBS_POLL_SEC", "120"))
 SEEN_FILE = os.environ.get(
     "SUBS_SEEN_FILE",
     os.path.join(os.path.dirname(os.path.abspath(__file__)),

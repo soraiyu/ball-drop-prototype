@@ -11,5 +11,5 @@ if [ ! -s rtmp_url.txt ]; then
 fi
 tmux kill-session -t live 2>/dev/null || true
 tmux new-session -d -s live \
-  "cd /opt/ballstream && CHAT_MODE=youtube SUBS_MODE=on THEME=light RTMP_URL=$(cat rtmp_url.txt) /opt/ballstream/.venv/bin/python stream_live.py >> live.log 2>&1"
+  "cd /opt/ballstream && CHAT_MODE=youtube-poll SUBS_MODE=on THEME=light CHAT_COOLDOWN_SEC=0 RTMP_URL=$(cat rtmp_url.txt) /opt/ballstream/.venv/bin/python stream_live.py >> live.log 2>&1"
 echo "stream started in tmux session 'live'"
