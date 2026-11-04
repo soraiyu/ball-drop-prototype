@@ -4,8 +4,13 @@ Demo version of ball_drop_stack.py for the GCP time-boxed demo:
   - renders in real time (frame pacing to FPS)
   - auto-spawns a ball every SPAWN_EVERY seconds (comment triggers come
     in the next iteration; spawn() is the single entry point for them)
-  - clears all balls when the pile reaches CLEAR_AT (default 100), the
-    rule we agreed a long stream needs so the floor does not fill up
+  - balls ACCUMULATE: the pond state (every ball, the cumulative
+    count, the co-op game) is saved to POND_STATE_FILE every 15 s and
+    restored on start, so stopping at night and restarting the next
+    day continues the same pond. Settled balls freeze into static
+    bodies to keep the solver cheap; past POND_MAX_BALLS (default
+    150) the oldest ball is removed (and the pile re-settles)
+    instead of the old clear-everything-at-100 rule
   - output is an RTMP URL (YouTube Live) when RTMP_URL is set,
     otherwise a local file for performance tests
 
@@ -22,9 +27,13 @@ Env:
   SUBS_MODE     off (default) / on / mock — new-subscriber watcher
                 (see subscriber_watch.py); on = YouTube API polling
   THEME         dark (default) / light — colour palette
+  POND_STATE_FILE  pond save file (default: pond_state.json next to
+                this script; persists across restarts on the VM disk)
+  POND_MAX_BALLS   soft cap on accumulated balls (default 150)
 
 Run:  .venv/bin/python stream_live.py
 """
+import json
 import math
 import os
 import random
@@ -40,7 +49,11 @@ W, H, FPS = 1280, 720, 30
 BALL_R = 26
 PEG_R = 12
 SPAWN_EVERY = 0.7
-CLEAR_AT = int(os.environ.get("CLEAR_AT", "100"))
+POND_MAX = int(os.environ.get("POND_MAX_BALLS", "150"))
+POND_FILE = os.environ.get(
+    "POND_STATE_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 "pond_state.json"))
 ELASTICITY = 0.45
 FRICTION = 0.6
 COLORS = [(231, 76, 60), (52, 152, 219), (241, 196, 15)]  # red / blue / yellow
@@ -101,6 +114,8 @@ balls = []  # (body, shape, colour, radius)
 spawned_total = 0
 _born = {}  # id(body) -> spawn monotonic time (for the unstick rule)
 _stuck_dir = {}  # id(body) -> escape direction while unsticking
+_frozen = set()  # id(body) of settled balls converted to static bodies
+_still = {}  # id(body) -> monotonic time the ball last moved fast
 
 # --- co-op goal game -------------------------------------------------
 GOAL_START = int(os.environ.get("GOAL_START", "50"))
@@ -168,7 +183,144 @@ def clear_balls():
     balls.clear()
     _born.clear()
     _stuck_dir.clear()
+    _frozen.clear()
+    _still.clear()
     print(f"[stream] cleared all balls at total {spawned_total}", flush=True)
+
+
+# --- pond accumulation ------------------------------------------------
+# The pond persists across restarts: balls, the cumulative spawn
+# count and the co-op game are saved to POND_FILE every 15 s and
+# restored at startup, so the pile keeps growing day after day.
+# A ball that barely moves for a few seconds freezes into a static
+# body (still drawn, still collidable) so a big pile stays cheap
+# for the physics solver.
+
+def _freeze_ball(idx):
+    body, shape, colour, radius = balls[idx]
+    pos, ang = body.position, body.angle
+    space.remove(body, shape)
+    nb = pymunk.Body(body_type=pymunk.Body.STATIC)
+    nb.position = pos
+    nb.angle = ang
+    ns = pymunk.Circle(nb, radius)
+    ns.elasticity = ELASTICITY
+    ns.friction = FRICTION
+    space.add(nb, ns)
+    balls[idx] = (nb, ns, colour, radius)
+    _frozen.add(id(nb))
+    _born.pop(id(body), None)
+    _stuck_dir.pop(id(body), None)
+    _still.pop(id(body), None)
+
+
+def _unfreeze_all():
+    """Wake every frozen ball so the pile can re-settle (used when
+    the cap removes a ball that others were resting on)."""
+    now = time.monotonic()
+    for idx, (body, shape, colour, radius) in enumerate(list(balls)):
+        if id(body) not in _frozen:
+            continue
+        pos, ang = body.position, body.angle
+        space.remove(body, shape)
+        nb = pymunk.Body(1.0, pymunk.moment_for_circle(1.0, 0, radius))
+        nb.position = pos
+        nb.angle = ang
+        ns = pymunk.Circle(nb, radius)
+        ns.elasticity = ELASTICITY
+        ns.friction = FRICTION
+        space.add(nb, ns)
+        balls[idx] = (nb, ns, colour, radius)
+        _frozen.discard(id(body))
+        _born[id(nb)] = now
+
+
+def enforce_cap():
+    """Soft cap: past POND_MAX balls, drop the oldest one and let
+    the pile re-settle — never the old all-at-once clear."""
+    while len(balls) > POND_MAX:
+        body, shape, _c, _r = balls.pop(0)
+        space.remove(body, shape)
+        _frozen.discard(id(body))
+        _born.pop(id(body), None)
+        _stuck_dir.pop(id(body), None)
+        _still.pop(id(body), None)
+        _unfreeze_all()
+        print("[stream] pond full: oldest ball sank away "
+              f"({len(balls)} balls kept)", flush=True)
+
+
+def save_pond():
+    try:
+        data = {
+            "version": 1,
+            "spawned_total": spawned_total,
+            "game": {k: game[k] for k in ("round", "goal", "progress")},
+            "balls": [{
+                "x": round(body.position.x, 1),
+                "y": round(body.position.y, 1),
+                "vx": round(body.velocity.x, 1),
+                "vy": round(body.velocity.y, 1),
+                "angle": round(body.angle, 3),
+                "c": list(colour),
+                "r": radius,
+                "frozen": id(body) in _frozen,
+            } for body, _s, colour, radius in balls],
+        }
+        tmp = POND_FILE + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, POND_FILE)
+    except Exception as e:
+        print(f"[stream] pond save failed: {e}", flush=True)
+
+
+def load_pond():
+    """Restore the saved pond. Returns the number of balls restored."""
+    global spawned_total
+    if not os.path.exists(POND_FILE):
+        return 0
+    try:
+        with open(POND_FILE) as fh:
+            data = json.load(fh)
+    except Exception as e:
+        print(f"[stream] pond load failed: {e}", flush=True)
+        return 0
+    now = time.monotonic()
+    n = 0
+    for b in data.get("balls", [])[:POND_MAX]:
+        colour = tuple(b["c"])
+        radius = b["r"]
+        if b.get("frozen"):
+            body = pymunk.Body(body_type=pymunk.Body.STATIC)
+            body.position = (b["x"], b["y"])
+            body.angle = b.get("angle", 0.0)
+            shape = pymunk.Circle(body, radius)
+            shape.elasticity = ELASTICITY
+            shape.friction = FRICTION
+            space.add(body, shape)
+            _frozen.add(id(body))
+        else:
+            body = pymunk.Body(
+                1.0, pymunk.moment_for_circle(1.0, 0, radius))
+            body.position = (b["x"], b["y"])
+            body.velocity = (b.get("vx", 0.0), b.get("vy", 0.0))
+            body.angle = b.get("angle", 0.0)
+            shape = pymunk.Circle(body, radius)
+            shape.elasticity = ELASTICITY
+            shape.friction = FRICTION
+            space.add(body, shape)
+            _born[id(body)] = now
+        balls.append((body, shape, colour, radius))
+        n += 1
+    spawned_total = int(data.get("spawned_total", n))
+    g = data.get("game") or {}
+    for k in ("round", "goal", "progress"):
+        if k in g:
+            game[k] = int(g[k])
+    print(f"[stream] pond restored: {n} balls "
+          f"(cumulative {spawned_total})", flush=True)
+    return n
 
 
 def celebrate(author):
@@ -426,7 +578,8 @@ def main():
     proc = subprocess.Popen(ffmpeg_cmd(), stdin=subprocess.PIPE,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     target = "RTMP" if RTMP_URL else OUTPUT
-    print(f"[stream] start -> {target} (clear at {CLEAR_AT})", flush=True)
+    print(f"[stream] start -> {target} (pond cap {POND_MAX})", flush=True)
+    restored = load_pond()
     chat_mode = os.environ.get("CHAT_MODE", "off").lower()
     spawn_queue = None
     if chat_mode in ("mock", "youtube", "youtube-poll"):
@@ -440,8 +593,9 @@ def main():
             source = chat_triggers.YouTubeChatStreamer(spawn_queue)
         source.start()
         print(f"[stream] chat mode: {chat_mode}", flush=True)
-        for _ in range(3):  # welcome balls so the scene is never empty
-            spawn()
+        if restored == 0:
+            for _ in range(3):  # welcome balls so the scene is never empty
+                spawn()
 
     subs_mode = os.environ.get("SUBS_MODE", "off").lower()
     subs_events = None
@@ -479,14 +633,12 @@ def main():
                           f"{game['goal']})", flush=True)
                     if game["progress"] >= game["goal"]:
                         celebrate(author)
-                    if len(balls) >= CLEAR_AT:
-                        clear_balls()
+                    enforce_cap()
             else:
                 while t >= next_spawn:
                     spawn()
                     next_spawn += SPAWN_EVERY
-                    if len(balls) >= CLEAR_AT:
-                        clear_balls()
+                    enforce_cap()
             for _ in range(3):
                 space.step((1.0 / FPS) / 3)
             # Unstick special (oversize) balls wedged on peg tops:
@@ -496,8 +648,18 @@ def main():
             # (one set velocity is not enough to climb out of the
             # pocket) until it is falling again.
             now_m = time.monotonic()
-            for body, _s, _c, _r in balls:
+            for idx, (body, _s, _c, _r) in enumerate(balls):
                 key = id(body)
+                # settled balls freeze into static bodies so a large
+                # accumulated pile stays cheap to simulate
+                if body.body_type == pymunk.Body.DYNAMIC:
+                    if body.velocity.length < 10:
+                        since = _still.setdefault(key, now_m)
+                        if now_m - since > 4:
+                            _freeze_ball(idx)
+                            continue
+                    else:
+                        _still.pop(key, None)
                 if _r <= BALL_R or body.position.y >= H - 120:
                     _stuck_dir.pop(key, None)
                     continue
@@ -512,6 +674,8 @@ def main():
                     body.velocity = (d * 190, body.velocity.y)
             proc.stdin.write(render_frame().tobytes())
             frame += 1
+            if frame % (FPS * 15) == 0:
+                save_pond()
             # real-time pacing: sleep until this frame's deadline
             deadline = start + frame / FPS
             delay = deadline - time.monotonic()
@@ -525,6 +689,7 @@ def main():
     except (BrokenPipeError, KeyboardInterrupt):
         pass
     finally:
+        save_pond()
         try:
             proc.stdin.close()
         except Exception:

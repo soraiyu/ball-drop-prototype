@@ -130,3 +130,12 @@
   start_stream.sh); queue cap 20 still applies.
 - A dedicated browser profile for GCP work exists: 「ボール配信GCP専用」
   p6b1a2f6d1c41 (see ~/TOOLS.md).
+- Pond accumulation (user request 2026-11-03, after noticing the
+  pond restarted from 0 every night): stream_live.py saves the pond
+  (balls, cumulative count, game state) to pond_state.json next to
+  the script every 15 s and restores it on start. Settled balls
+  freeze to static bodies; the clear-all-at-100 rule is replaced by
+  a soft cap (POND_MAX_BALLS, default 150) that removes only the
+  oldest ball and lets the pile re-settle. Datastore/Firestore was
+  considered and deferred by the user (disk JSON is enough until a
+  VM move or an outside view of the pond is needed).
